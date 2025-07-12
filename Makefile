@@ -1,24 +1,20 @@
-obj-m += kmon_module.o
+obj-m += kmon.o
+kmon-objs := kmon_module.o symbol_resolver.o hash_ops.o monitor.o proc_interface.o
 
-KDIR := /lib/modules/$(shell uname -r)/build
+KERNEL_DIR := /lib/modules/$(shell uname -r)/build
 PWD := $(shell pwd)
-INSTALL_DIR := /lib/modules/$(shell uname -r)/kernel/drivers/mymodules
 
 all:
-	make -C $(KDIR) M=$(PWD) modules
+	make -C $(KERNEL_DIR) M=$(PWD) modules
 
 clean:
-	make -C $(KDIR) M=$(PWD) clean
+	make -C $(KERNEL_DIR) M=$(PWD) clean
 
-install:
-	sudo mkdir -p $(INSTALL_DIR)
-	sudo cp kmon_module.ko $(INSTALL_DIR)
-	sudo depmod -a 
-	@echo "kmon_module.ko installed to $(INSTALL_DIR)"
-
+install: all
+	sudo insmod kmon.ko
 
 uninstall:
-	sudo rm -f $(INSTALL_DIR)/kmon_module.ko
-	sudo depmod -a
-	@echo "kmon_module.ko removed from $(INSTALL_DIR)"
+	sudo rmmod kmon
+
+.PHONY: all clean install uninstall
 

@@ -1,137 +1,75 @@
-#include <linux/module.h>
-#include <linux/kernel.h>
-#include <linux/init.h>
-#include <linux/unistd.h>
-#include <linux/string.h>
-#include <linux/slab.h>
-#include <linux/crypto.h>
-#include <crypto/hash.h>
-#include <linux/kallsyms.h>
-#include <linux/kprobes.h>
-#include <asm/unistd.h> 
+#include "kmon.h"
+#include "symbol_resolver.h"
+#include "hash_ops.h"
+#include "monitor.h"
+#include "proc_interface.h"
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Sanoj");
-MODULE_DESCRIPTION("Kernel Integrity Monitor - Step 1");
+MODULE_DESCRIPTION("Kernel Integrity Monitor with Real-Time Monitoring");
 
+// Global variable definitions
 unsigned long **syscall_table;
+struct hash_entry hash_history[MAX_HASH_HISTORY];
+int hash_count = 0;
+int current_index = 0;
+struct timer_list monitor_timer;
+struct proc_dir_entry *proc_entry;
+bool monitoring_enabled = true;
 
-#define HASH_LENGTH 32 // SHA-256 outputs 32 bytes
-
-// Function to get kallsyms_lookup_name address using kprobe
-static unsigned long (*kallsyms_lookup_name_ptr)(const char *name);
-
-static int get_kallsyms_lookup_name(void)
+static int __init kmon_init(void)
 {
-    struct kprobe kp = {
-        .symbol_name = "kallsyms_lookup_name"
-    };
+    unsigned char baseline_hash[HASH_LENGTH];
+    int ret;
     
-    if (register_kprobe(&kp) < 0) {
-        pr_err("KIM: Failed to register kprobe\n");
-        return -1;
+    pr_info("kmon: Module loaded\n");
+
+    // Find syscall table
+    ret = find_syscall_table();
+    if (ret < 0) {
+        pr_err("kmon: Failed to locate sys_call_table\n");
+        return ret;
+    }
+
+    // Create proc interface
+    ret = create_proc_interface();
+    if (ret < 0) {
+        pr_err("kmon: Failed to create proc interface\n");
+        return ret;
+    }
+
+    // Compute and store baseline hash
+    ret = hash_syscall_table_to_buffer(baseline_hash);
+    if (ret == 0) {
+        store_hash_entry(baseline_hash, true, false);
+        pr_info("kmon: Baseline hash established\n");
+    } else {
+        pr_err("kmon: Failed to establish baseline hash\n");
+        cleanup_proc_interface();
+        return ret;
+    }
+
+    // Start monitoring
+    ret = start_monitoring();
+    if (ret < 0) {
+        pr_err("kmon: Failed to start monitoring\n");
+        cleanup_proc_interface();
+        return ret;
     }
     
-    kallsyms_lookup_name_ptr = (unsigned long (*)(const char *))kp.addr;
-    unregister_kprobe(&kp);
-    
+    pr_info("kmon: Real-time monitoring started (interval: %d seconds)\n", MONITOR_INTERVAL_SEC);
+    pr_info("kmon: Use 'cat /proc/kmon' to view hash history\n");
+    pr_info("kmon: Use 'echo start/stop/clear > /proc/kmon' to control monitoring\n");
+
     return 0;
 }
 
-static int find_syscall_table(void)
+static void __exit kmon_exit(void)
 {
-    // Get kallsyms_lookup_name function pointer
-    if (get_kallsyms_lookup_name() < 0) {
-        pr_err("KIM: Failed to get kallsyms_lookup_name\n");
-        return -1;
-    }
-    
-    // Look up the system call table
-    syscall_table = (unsigned long **)kallsyms_lookup_name_ptr("sys_call_table");
-    
-    if (!syscall_table) {
-        pr_err("KIM: Failed to find sys_call_table\n");
-        return -1;
-    }
-    
-    pr_info("KIM: Found sys_call_table at address: %px\n", syscall_table);
-    return 0;
+    stop_monitoring();
+    cleanup_proc_interface();
+    pr_info("kmon: Module unloaded\n");
 }
 
-static int hash_syscall_table(void)
-{
-    struct crypto_shash *tfm;
-    struct shash_desc *shash;
-    unsigned char *digest;
-    void *table_copy;
-    int i, ret;
-
-    size_t table_size = sizeof(void *) * NR_syscalls;
-
-    tfm = crypto_alloc_shash("sha256", 0, 0);
-    if (IS_ERR(tfm))
-    {
-        pr_err("KIM: crypto_alloc_shash failed\n");
-        return PTR_ERR(tfm);
-    }
-
-    shash = kmalloc(sizeof(*shash) + crypto_shash_descsize(tfm), GFP_KERNEL);
-    digest = kmalloc(HASH_LENGTH, GFP_KERNEL);
-    table_copy = kmalloc(table_size, GFP_KERNEL);
-
-    if (!shash || !digest || !table_copy)
-    {
-        pr_err("KIM: Memory allocation failed\n");
-        ret = -ENOMEM;
-        goto free_all;
-    }
-
-    memcpy(table_copy, syscall_table, table_size);
-
-    shash->tfm = tfm;
-    // shash->flags = 0;  // No longer used in newer kernels
-
-    ret = crypto_shash_init(shash);
-    ret |= crypto_shash_update(shash, table_copy, table_size);
-    ret |= crypto_shash_final(shash, digest);
-
-    if (ret)
-    {
-        pr_err("KIM: Hashing failed\n");
-        goto free_all;
-    }
-
-    pr_info("KIM: SHA-256 hash of syscall table:\n");
-    for (i = 0; i < HASH_LENGTH; i++)
-        pr_cont("%02x", digest[i]);
-    pr_cont("\n");
-
-free_all:
-    kfree(shash);
-    kfree(digest);
-    kfree(table_copy);
-    crypto_free_shash(tfm);
-    return ret;
-}
-
-static int __init kim_init(void)
-{
-    pr_info("KIM: Module loaded\n");
-
-    // Dynamically find syscall table instead of hardcoding
-    if (find_syscall_table() < 0) {
-        pr_err("KIM: Failed to locate sys_call_table\n");
-        return -1;
-    }
-
-    hash_syscall_table();
-    return 0;
-}
-
-static void __exit kim_exit(void)
-{
-    pr_info("KIM: Module unloaded\n");
-}
-
-module_init(kim_init);
-module_exit(kim_exit);
+module_init(kmon_init);
+module_exit(kmon_exit);
